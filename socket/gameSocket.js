@@ -180,7 +180,32 @@ module.exports = (io) => {
       }
     });
 
-    // Update Settings (host only)
+    // Spectate Room — join as observer, no gameplay
+    socket.on('spectate_room', async ({ roomCode, playerId }) => {
+      try {
+        logger.info('Spectate room attempt', { roomCode, playerId });
+        const room = await Room.findOne({ roomCode: roomCode.toUpperCase() });
+        if (!room) {
+          logger.warn('Spectate failed — room not found', { roomCode });
+          return socket.emit('error', { message: 'Room not found' });
+        }
+        socket.join(roomCode.toUpperCase());
+        socket.spectating = roomCode.toUpperCase();
+        logger.info('Spectator joined', { roomCode, playerId, roomStatus: room.status });
+        socket.emit('spectate_joined', {
+          roomCode: room.roomCode,
+          status: room.status,
+          players: room.players,
+          currentSubstring: room.currentSubstring,
+          currentPlayerIndex: room.currentPlayerIndex,
+          settings: room.settings,
+        });
+      } catch (err) {
+        logger.error('spectate_room failed', { error: err.message });
+        socket.emit('error', { message: 'Failed to spectate room' });
+      }
+    });
+
     socket.on('update_settings', async ({ roomCode, settings }) => {
       try {
         const room = await Room.findOne({ roomCode });
