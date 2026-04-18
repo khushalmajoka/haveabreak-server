@@ -1,8 +1,13 @@
-const Room = require('../models/Room');
+const Room             = require('../models/Room');
 const { generateSubstring, isValidWord } = require('../utils/wordUtils');
-const logger = require('../utils/logger');
+const logger           = require('../utils/logger');
+const validate         = require('../utils/validate');
 
-const activeTimers = {}; // roomCode -> timer interval
+// ── Active timers — exported so index.js can clear them on graceful shutdown ──
+const activeTimers = {}; // roomCode -> setTimeout handle
+module.exports.activeTimers = activeTimers;
+
+// ── Timer helpers ─────────────────────────────────────────────────────────────
 
 function clearRoomTimer(roomCode) {
   if (activeTimers[roomCode]) {
@@ -18,13 +23,12 @@ function startTurnTimer(io, roomCode, duration) {
 
   activeTimers[roomCode] = setTimeout(async () => {
     try {
-      const room = await Room.findOne({ roomCode });
+      const room = await Room.findOne({ roomCode, game: 'wordbomb' });
       if (!room || room.status !== 'playing') return;
 
       const currentPlayer = room.players[room.currentPlayerIndex];
       if (!currentPlayer || !currentPlayer.isAlive) return;
 
-      // Deduct a life
       currentPlayer.lives -= 1;
       if (currentPlayer.lives <= 0) {
         currentPlayer.isAlive = false;
@@ -39,13 +43,12 @@ function startTurnTimer(io, roomCode, duration) {
       });
 
       io.to(roomCode).emit('time_up', {
-        playerId: currentPlayer.id,
-        playerName: currentPlayer.name,
-        livesLeft: currentPlayer.lives,
+        playerId:    currentPlayer.id,
+        playerName:  currentPlayer.name,
+        livesLeft:   currentPlayer.lives,
         isEliminated: !currentPlayer.isAlive,
       });
 
-      // Check if game over
       const alivePlayers = room.players.filter(p => p.isAlive);
       if (alivePlayers.length <= 1) {
         room.status = 'finished';
@@ -55,13 +58,12 @@ function startTurnTimer(io, roomCode, duration) {
           winner: alivePlayers[0]?.name || 'none',
         });
         io.to(roomCode).emit('game_over', {
-          winner: alivePlayers[0] || null,
+          winner:  alivePlayers[0] || null,
           players: room.players,
         });
         return;
       }
 
-      // Move to next alive player
       await advanceTurn(io, room);
     } catch (err) {
       logger.error('Timer callback error', { roomCode, error: err.message, stack: err.stack });
@@ -73,66 +75,89 @@ async function advanceTurn(io, room) {
   const alivePlayers = room.players.filter(p => p.isAlive);
   if (alivePlayers.length === 0) return;
 
-  // Find next alive player
   let nextIndex = (room.currentPlayerIndex + 1) % room.players.length;
-  let attempts = 0;
+  let attempts  = 0;
   while (!room.players[nextIndex].isAlive && attempts < room.players.length) {
     nextIndex = (nextIndex + 1) % room.players.length;
     attempts++;
   }
 
   room.currentPlayerIndex = nextIndex;
-  room.currentSubstring = generateSubstring();
+  room.currentSubstring   = generateSubstring();
   await room.save();
 
   const currentPlayer = room.players[nextIndex];
   logger.info('Turn advanced', {
-    roomCode: room.roomCode,
-    player: currentPlayer.name,
-    substring: room.currentSubstring,
+    roomCode:      room.roomCode,
+    player:        currentPlayer.name,
+    substring:     room.currentSubstring,
     timerDuration: room.settings.turnTimer,
   });
 
   io.to(room.roomCode).emit('next_turn', {
     currentPlayer,
-    substring: room.currentSubstring,
-    players: room.players,
+    substring:     room.currentSubstring,
+    players:       room.players,
     timerDuration: room.settings.turnTimer,
   });
 
   startTurnTimer(io, room.roomCode, room.settings.turnTimer);
 }
 
+// ── Room code generator with retry on duplicate key ───────────────────────────
+async function generateUniqueRoomCode(maxAttempts = 5) {
+  for (let i = 0; i < maxAttempts; i++) {
+    const code = Math.random().toString(36).substring(2, 7).toUpperCase();
+    const existing = await Room.findOne({ roomCode: code, game: 'wordbomb' });
+    if (!existing) return code;
+  }
+  throw new Error('Could not generate a unique room code after several attempts');
+}
+
+// ── Socket handlers ───────────────────────────────────────────────────────────
+
 module.exports = (io) => {
   io.on('connection', (socket) => {
     logger.info('Socket connected', { socketId: socket.id });
 
-    // Create Room
-    socket.on('create_room', async ({ playerName, settings, playerId }) => {
+    // ── Create Room ───────────────────────────────────────────────────────────
+    socket.on('create_room', async (data = {}) => {
       try {
-        const roomCode = Math.random().toString(36).substring(2, 7).toUpperCase();
-        const stableId = playerId || socket.id; // use client-provided stable ID
-        logger.info('Creating room', { roomCode, host: playerName, stableId, settings });
+        // Validate input first — reject bad data immediately
+        const v = validate.createRoom(data);
+        if (!v.ok) {
+          logger.warn('create_room rejected — invalid input', { reason: v.reason, socketId: socket.id });
+          return socket.emit('error', { message: v.reason });
+        }
+
+        const { playerName, settings, playerId } = data;
+        const stableId  = (typeof playerId === 'string' && playerId.length <= 64) ? playerId : socket.id;
+        const cleanName = playerName.trim();
+
+        const roomCode = await generateUniqueRoomCode();
+        logger.info('Creating room', { roomCode, host: cleanName, stableId, settings });
 
         const room = new Room({
           roomCode,
+          game: 'wordbomb',
           settings: {
-            maxLives: settings?.maxLives || 3,
-            turnTimer: settings?.turnTimer || 15,
+            maxLives:   settings?.maxLives   || 3,
+            turnTimer:  settings?.turnTimer  || 15,
             maxPlayers: settings?.maxPlayers || 8,
           },
           players: [{
-            id: stableId,
-            name: playerName || 'Player 1',
-            lives: settings?.maxLives || 3,
-            isAlive: true,
-            isHost: true,
+            id:       stableId,
+            name:     cleanName,
+            lives:    settings?.maxLives || 3,
+            isAlive:  true,
+            isHost:   true,
             socketId: socket.id,
           }],
         });
+
         await room.save();
         socket.join(roomCode);
-        logger.info('Room created and saved', { roomCode, host: playerName });
+        logger.info('Room created and saved', { roomCode, host: cleanName });
         socket.emit('room_created', { roomCode, room, playerId: stableId });
       } catch (err) {
         logger.error('create_room failed', { error: err.message, stack: err.stack });
@@ -140,11 +165,23 @@ module.exports = (io) => {
       }
     });
 
-    // Join Room
-    socket.on('join_room', async ({ roomCode, playerName, playerId }) => {
+    // ── Join Room ─────────────────────────────────────────────────────────────
+    socket.on('join_room', async (data = {}) => {
       try {
-        logger.info('Join room attempt', { roomCode, playerName, playerId });
-        const room = await Room.findOne({ roomCode: roomCode.toUpperCase() });
+        const v = validate.joinRoom(data);
+        if (!v.ok) {
+          logger.warn('join_room rejected — invalid input', { reason: v.reason, socketId: socket.id });
+          return socket.emit('error', { message: v.reason });
+        }
+
+        const { playerName, playerId } = data;
+        const roomCode  = data.roomCode.toUpperCase();
+        const stableId  = (typeof playerId === 'string' && playerId.length <= 64) ? playerId : socket.id;
+        const cleanName = playerName.trim();
+
+        logger.info('Join room attempt', { roomCode, playerName: cleanName, stableId });
+
+        const room = await Room.findOne({ roomCode, game: 'wordbomb' });
 
         if (!room) {
           logger.warn('Join failed — room not found', { roomCode });
@@ -159,19 +196,20 @@ module.exports = (io) => {
           return socket.emit('error', { message: 'Room is full' });
         }
 
-        const stableId = playerId || socket.id;
         const newPlayer = {
-          id: stableId,
-          name: playerName || `Player ${room.players.length + 1}`,
-          lives: room.settings.maxLives,
-          isAlive: true,
-          isHost: false,
+          id:       stableId,
+          name:     cleanName,
+          lives:    room.settings.maxLives,
+          isAlive:  true,
+          isHost:   false,
           socketId: socket.id,
         };
+
         room.players.push(newPlayer);
         await room.save();
-        socket.join(roomCode.toUpperCase());
-        logger.info('Player joined room', { roomCode, player: playerName, totalPlayers: room.players.length });
+        socket.join(roomCode);
+
+        logger.info('Player joined room', { roomCode, player: cleanName, totalPlayers: room.players.length });
         socket.emit('room_joined', { roomCode: room.roomCode, room, playerId: stableId });
         io.to(room.roomCode).emit('player_joined', { player: newPlayer, players: room.players });
       } catch (err) {
@@ -180,25 +218,33 @@ module.exports = (io) => {
       }
     });
 
-    // Spectate Room — join as observer, no gameplay
-    socket.on('spectate_room', async ({ roomCode, playerId }) => {
+    // ── Spectate Room ─────────────────────────────────────────────────────────
+    socket.on('spectate_room', async (data = {}) => {
       try {
-        logger.info('Spectate room attempt', { roomCode, playerId });
-        const room = await Room.findOne({ roomCode: roomCode.toUpperCase() });
+        const v = validate.spectateRoom(data);
+        if (!v.ok) {
+          return socket.emit('error', { message: v.reason });
+        }
+
+        const roomCode = data.roomCode.toUpperCase();
+        logger.info('Spectate room attempt', { roomCode, socketId: socket.id });
+
+        const room = await Room.findOne({ roomCode, game: 'wordbomb' });
         if (!room) {
           logger.warn('Spectate failed — room not found', { roomCode });
           return socket.emit('error', { message: 'Room not found' });
         }
-        socket.join(roomCode.toUpperCase());
-        socket.spectating = roomCode.toUpperCase();
-        logger.info('Spectator joined', { roomCode, playerId, roomStatus: room.status });
+
+        socket.join(roomCode);
+        socket.spectating = roomCode;
+        logger.info('Spectator joined', { roomCode, roomStatus: room.status });
         socket.emit('spectate_joined', {
-          roomCode: room.roomCode,
-          status: room.status,
-          players: room.players,
-          currentSubstring: room.currentSubstring,
+          roomCode:           room.roomCode,
+          status:             room.status,
+          players:            room.players,
+          currentSubstring:   room.currentSubstring,
           currentPlayerIndex: room.currentPlayerIndex,
-          settings: room.settings,
+          settings:           room.settings,
         });
       } catch (err) {
         logger.error('spectate_room failed', { error: err.message });
@@ -206,18 +252,29 @@ module.exports = (io) => {
       }
     });
 
-    socket.on('update_settings', async ({ roomCode, settings }) => {
+    // ── Update Settings (host only) ───────────────────────────────────────────
+    socket.on('update_settings', async (data = {}) => {
       try {
-        const room = await Room.findOne({ roomCode });
+        const v = validate.updateSettings(data);
+        if (!v.ok) {
+          return socket.emit('error', { message: v.reason });
+        }
+
+        const roomCode = data.roomCode.toUpperCase();
+        const { settings } = data;
+
+        const room = await Room.findOne({ roomCode, game: 'wordbomb' });
         if (!room) return;
+
         const host = room.players.find(p => p.socketId === socket.id && p.isHost);
         if (!host) {
           logger.warn('update_settings rejected — not host', { roomCode, socketId: socket.id });
           return socket.emit('error', { message: 'Only host can change settings' });
         }
+
         logger.info('Settings updated', { roomCode, newSettings: settings, by: host.name });
         room.settings = { ...room.settings.toObject(), ...settings };
-        room.players = room.players.map(p => ({ ...p.toObject(), lives: room.settings.maxLives }));
+        room.players  = room.players.map(p => ({ ...p.toObject(), lives: room.settings.maxLives }));
         await room.save();
         io.to(roomCode).emit('settings_updated', { settings: room.settings, players: room.players });
       } catch (err) {
@@ -226,11 +283,18 @@ module.exports = (io) => {
       }
     });
 
-    // Start Game (host only)
-    socket.on('start_game', async ({ roomCode }) => {
+    // ── Start Game (host only) ────────────────────────────────────────────────
+    socket.on('start_game', async (data = {}) => {
       try {
-        const room = await Room.findOne({ roomCode });
+        const v = validate.startGame(data);
+        if (!v.ok) {
+          return socket.emit('error', { message: v.reason });
+        }
+
+        const roomCode = data.roomCode.toUpperCase();
+        const room = await Room.findOne({ roomCode, game: 'wordbomb' });
         if (!room) return;
+
         const host = room.players.find(p => p.socketId === socket.id && p.isHost);
         if (!host) {
           logger.warn('start_game rejected — not host', { roomCode, socketId: socket.id });
@@ -241,23 +305,23 @@ module.exports = (io) => {
           return socket.emit('error', { message: 'Need at least 2 players to start' });
         }
 
-        room.status = 'playing';
+        room.status             = 'playing';
         room.currentPlayerIndex = 0;
-        room.currentSubstring = generateSubstring();
-        room.usedWords = [];
+        room.currentSubstring   = generateSubstring();
+        room.usedWords          = [];
         await room.save();
 
         logger.info('Game started', {
           roomCode,
-          players: room.players.map(p => p.name),
-          firstSubstring: room.currentSubstring,
-          settings: room.settings,
+          players:         room.players.map(p => p.name),
+          firstSubstring:  room.currentSubstring,
+          settings:        room.settings,
         });
 
         io.to(roomCode).emit('game_started', {
           currentPlayer: room.players[0],
-          substring: room.currentSubstring,
-          players: room.players,
+          substring:     room.currentSubstring,
+          players:       room.players,
           timerDuration: room.settings.turnTimer,
         });
 
@@ -268,36 +332,42 @@ module.exports = (io) => {
       }
     });
 
-    // Submit Word
-    socket.on('submit_word', async ({ roomCode, word }) => {
+    // ── Submit Word ───────────────────────────────────────────────────────────
+    socket.on('submit_word', async (data = {}) => {
       try {
-        const room = await Room.findOne({ roomCode });
+        // Input validation — catches 100,000-char words and garbage data
+        const v = validate.submitWord(data);
+        if (!v.ok) {
+          logger.warn('submit_word rejected — invalid input', { reason: v.reason, socketId: socket.id });
+          return socket.emit('word_result', { success: false, reason: v.reason });
+        }
+
+        const roomCode = data.roomCode.toUpperCase();
+        const room = await Room.findOne({ roomCode, game: 'wordbomb' });
         if (!room || room.status !== 'playing') return;
 
         const currentPlayer = room.players[room.currentPlayerIndex];
         if (!currentPlayer || currentPlayer.socketId !== socket.id) {
           logger.warn('submit_word — not your turn', {
             roomCode,
-            submittedBy: socket.id,
+            submittedBy:      socket.id,
             expectedSocketId: currentPlayer?.socketId,
           });
           return socket.emit('error', { message: "It's not your turn!" });
         }
 
-        const w = word.toLowerCase().trim();
+        const w = data.word.toLowerCase().trim();
 
-        // Check if word was already used
         if (room.usedWords.includes(w)) {
           logger.debug('Word already used', { roomCode, word: w, player: currentPlayer.name });
           return socket.emit('word_result', { success: false, reason: 'Word already used!' });
         }
 
-        // Validate word
         if (!isValidWord(w, room.currentSubstring)) {
           logger.debug('Word invalid', { roomCode, word: w, substring: room.currentSubstring, player: currentPlayer.name });
           return socket.emit('word_result', {
             success: false,
-            reason: `"${w}" doesn't contain "${room.currentSubstring}" or isn't a valid word`,
+            reason:  `"${w}" doesn't contain "${room.currentSubstring}" or isn't a valid word`,
           });
         }
 
@@ -307,17 +377,17 @@ module.exports = (io) => {
 
         logger.info('Word accepted', {
           roomCode,
-          player: currentPlayer.name,
-          word: w,
-          substring: room.currentSubstring,
+          player:         currentPlayer.name,
+          word:           w,
+          substring:      room.currentSubstring,
           totalUsedWords: room.usedWords.length,
         });
 
         io.to(roomCode).emit('word_accepted', {
-          playerId: currentPlayer.id,
+          playerId:   currentPlayer.id,
           playerName: currentPlayer.name,
-          word: w,
-          substring: room.currentSubstring,
+          word:       w,
+          substring:  room.currentSubstring,
         });
 
         await advanceTurn(io, room);
@@ -327,22 +397,25 @@ module.exports = (io) => {
       }
     });
 
-    // Disconnect
+    // ── Disconnect ────────────────────────────────────────────────────────────
+    // FIXED: Added game: 'wordbomb' filter so this handler only processes
+    // Word Bomb rooms, not Cards Bluff rooms (which bluffSocket handles).
     socket.on('disconnect', async () => {
       logger.info('Socket disconnected', { socketId: socket.id });
       try {
-        const rooms = await Room.find({ 'players.socketId': socket.id });
+        // KEY FIX: game filter added here
+        const rooms = await Room.find({ game: 'wordbomb', 'players.socketId': socket.id });
         for (const room of rooms) {
           const playerIdx = room.players.findIndex(p => p.socketId === socket.id);
           if (playerIdx === -1) continue;
 
-          const wasHost = room.players[playerIdx].isHost;
+          const wasHost    = room.players[playerIdx].isHost;
           const playerName = room.players[playerIdx].name;
           room.players.splice(playerIdx, 1);
 
           logger.info('Player removed from room on disconnect', {
-            roomCode: room.roomCode,
-            player: playerName,
+            roomCode:         room.roomCode,
+            player:           playerName,
             wasHost,
             remainingPlayers: room.players.length,
           });
@@ -354,7 +427,6 @@ module.exports = (io) => {
             continue;
           }
 
-          // Assign new host if needed
           if (wasHost && room.players.length > 0) {
             room.players[0].isHost = true;
             logger.info('New host assigned', { roomCode: room.roomCode, newHost: room.players[0].name });
@@ -367,10 +439,10 @@ module.exports = (io) => {
               await room.save();
               logger.info('Game ended due to disconnect', {
                 roomCode: room.roomCode,
-                winner: alivePlayers[0]?.name || 'none',
+                winner:   alivePlayers[0]?.name || 'none',
               });
               io.to(room.roomCode).emit('game_over', {
-                winner: alivePlayers[0] || null,
+                winner:  alivePlayers[0] || null,
                 players: room.players,
               });
               clearRoomTimer(room.roomCode);
