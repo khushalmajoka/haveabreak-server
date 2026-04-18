@@ -6,6 +6,7 @@ const cors = require('cors');
 const mongoose = require('mongoose');
 const roomRoutes = require('./routes/rooms');
 const gameSocket = require('./socket/gameSocket');
+const bluffSocket = require('./socket/bluffSocket');
 
 const app = express();
 const server = http.createServer(app);
@@ -32,13 +33,13 @@ app.use(express.json());
 
 // Routes
 app.use('/api/rooms', roomRoutes);
+app.get('/health', (req, res) => res.json({ status: 'ok', games: ['wordbomb', 'cardsbluff'] }));
 
-app.get('/health', (req, res) => res.json({ status: 'ok' }));
+// Socket handlers — each game has its own handler
+gameSocket(io);   // Word Bomb
+bluffSocket(io);  // Cards Bluff
 
-// Socket
-gameSocket(io);
-
-// MongoDB
+// MongoDB (used by Word Bomb only — Cards Bluff is in-memory)
 const MONGO_URI = process.env.MONGO_URI || 'mongodb://localhost:27017/wordbomb';
 mongoose.connect(MONGO_URI)
   .then(() => logger.info('MongoDB connected', { uri: MONGO_URI.split('@').pop() }))
@@ -46,5 +47,5 @@ mongoose.connect(MONGO_URI)
 
 const PORT = process.env.PORT || 5000;
 server.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
+  logger.info(`Server running on port ${PORT}`);
 });
