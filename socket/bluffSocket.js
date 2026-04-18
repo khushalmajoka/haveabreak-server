@@ -1,19 +1,47 @@
-const { dealCards, wasBluff, createBluffRoom, RANKS } = require('../utils/cardUtils');
+const Room = require('../models/Room');
+const { dealCards, wasBluff, createBluffRoom, RANKS, RANK_ORDER } = require('../utils/cardUtils');
 const logger = require('../utils/logger');
 
-// In-memory store — no MongoDB needed for this game
-const bluffRooms = new Map(); // roomCode → roomState
+function normalizeCode(roomCode) {
+  return roomCode?.toUpperCase();
+}
+
+function getHand(player) {
+  return Array.isArray(player?.hand) ? player.hand : [];
+}
+
+function syncPlayerCardCounts(room) {
+  room.players.forEach(player => {
+    player.cardCount = getHand(player).length;
+  });
+}
 
 function addLog(room, type, msg) {
   room.log.push({ type, msg, ts: Date.now() });
-  if (room.log.length > 60) room.log.shift(); // keep last 60 entries
+  if (room.log.length > 60) room.log.shift();
+}
+
+function markBluffStateModified(room) {
+  room.markModified('players');
+  room.markModified('pile');
+  room.markModified('lastClaim');
+  room.markModified('lastPlayedCards');
+  room.markModified('winner');
+  room.markModified('log');
+  room.markModified('settings');
+}
+
+async function saveBluffRoom(room) {
+  syncPlayerCardCounts(room);
+  markBluffStateModified(room);
+  await room.save();
 }
 
 function nextAliveIndex(room, fromIndex) {
   const n = room.players.length;
   let idx = (fromIndex + 1) % n;
   let attempts = 0;
-  while (!room.players[idx].isAlive && attempts < n) {
+  while (!room.players[idx]?.isAlive && attempts < n) {
     idx = (idx + 1) % n;
     attempts++;
   }
@@ -23,13 +51,18 @@ function nextAliveIndex(room, fromIndex) {
 function checkWinner(room) {
   const alive = room.players.filter(p => p.isAlive);
   if (alive.length === 1) return alive[0];
-  // Also win if you emptied your hand
-  const empty = room.players.find(p => p.isAlive && p.hand.length === 0);
+
+  const empty = room.players.find(p => p.isAlive && getHand(p).length === 0);
   return empty || null;
 }
 
+async function findBluffRoom(roomCode) {
+  return Room.findOne({ roomCode: normalizeCode(roomCode), game: 'cardsbluff' });
+}
+
 function emitRoomState(io, room) {
-  // Send each player their own hand, others get card counts only
+  syncPlayerCardCounts(room);
+
   room.players.forEach(player => {
     const socketId = player.socketId;
     if (!socketId) return;
@@ -39,9 +72,8 @@ function emitRoomState(io, room) {
       name: p.name,
       isHost: p.isHost,
       isAlive: p.isAlive,
-      cardCount: p.hand.length,
-      // Only send own hand
-      hand: p.id === player.id ? p.hand : [],
+      cardCount: getHand(p).length,
+      hand: p.id === player.id ? getHand(p) : [],
     }));
 
     io.to(socketId).emit('bluff_state', {
@@ -58,13 +90,16 @@ function emitRoomState(io, room) {
     });
   });
 
-  // Also emit to spectators (they get no hand info)
   io.to(`spectate:${room.roomCode}`).emit('bluff_state', {
     roomCode: room.roomCode,
     status: room.status,
     players: room.players.map(p => ({
-      id: p.id, name: p.name, isHost: p.isHost,
-      isAlive: p.isAlive, cardCount: p.hand.length, hand: [],
+      id: p.id,
+      name: p.name,
+      isHost: p.isHost,
+      isAlive: p.isAlive,
+      cardCount: getHand(p).length,
+      hand: [],
     })),
     currentPlayerIndex: room.currentPlayerIndex,
     currentPlayer: room.players[room.currentPlayerIndex],
@@ -77,47 +112,52 @@ function emitRoomState(io, room) {
 }
 
 module.exports = (io) => {
-  // ── Create Room ────────────────────────────────────────────────────────────
   io.on('connection', (socket) => {
-
-    socket.on('bluff_create_room', ({ playerName, playerId, settings }) => {
+    socket.on('bluff_create_room', async ({ playerName, playerId, settings }) => {
       try {
         const roomCode = Math.random().toString(36).substring(2, 7).toUpperCase();
         const stableId = playerId || socket.id;
-        const room = createBluffRoom(roomCode, stableId, playerName || 'Player 1', settings);
-        room.players[0].socketId = socket.id;
+        const roomData = createBluffRoom(roomCode, stableId, playerName || 'Player 1', settings);
+        roomData.players[0].socketId = socket.id;
+        roomData.settings = {
+          maxLives: settings?.maxLives || 3,
+          turnTimer: settings?.turnTimer || 15,
+          maxPlayers: settings?.maxPlayers || roomData.settings.maxPlayers || 6,
+          startingCards: settings?.startingCards || null,
+        };
 
-        bluffRooms.set(roomCode, room);
+        const room = new Room(roomData);
+        await saveBluffRoom(room);
         socket.join(roomCode);
 
-        logger.info('[Bluff] Room created', { roomCode, host: playerName });
+        logger.info('[Bluff] Room created and saved', { roomCode, host: playerName });
         socket.emit('bluff_room_created', { roomCode, playerId: stableId });
         emitRoomState(io, room);
       } catch (err) {
-        logger.error('[Bluff] create_room error', { error: err.message });
+        logger.error('[Bluff] create_room error', { error: err.message, stack: err.stack });
         socket.emit('bluff_error', { message: 'Failed to create room' });
       }
     });
 
-    // ── Join Room ────────────────────────────────────────────────────────────
-    socket.on('bluff_join_room', ({ roomCode, playerName, playerId }) => {
+    socket.on('bluff_join_room', async ({ roomCode, playerName, playerId }) => {
       try {
-        const room = bluffRooms.get(roomCode?.toUpperCase());
+        const code = normalizeCode(roomCode);
+        const room = await findBluffRoom(code);
         if (!room) return socket.emit('bluff_error', { message: 'Room not found' });
-        if (room.status !== 'waiting') return socket.emit('bluff_error', { message: 'Game already in progress' });
-        if (room.players.length >= room.settings.maxPlayers) return socket.emit('bluff_error', { message: 'Room is full' });
 
         const stableId = playerId || socket.id;
-        // Prevent duplicate join
-        if (room.players.find(p => p.id === stableId)) {
-          // Reconnect — update socketId
-          const p = room.players.find(p => p.id === stableId);
-          p.socketId = socket.id;
-          socket.join(roomCode.toUpperCase());
+        const existingPlayer = room.players.find(p => p.id === stableId);
+        if (existingPlayer) {
+          existingPlayer.socketId = socket.id;
+          socket.join(code);
+          await saveBluffRoom(room);
           socket.emit('bluff_room_joined', { roomCode: room.roomCode, playerId: stableId });
           emitRoomState(io, room);
           return;
         }
+
+        if (room.status !== 'waiting') return socket.emit('bluff_error', { message: 'Game already in progress' });
+        if (room.players.length >= room.settings.maxPlayers) return socket.emit('bluff_error', { message: 'Room is full' });
 
         room.players.push({
           id: stableId,
@@ -129,63 +169,83 @@ module.exports = (io) => {
           isAlive: true,
         });
 
-        socket.join(roomCode.toUpperCase());
-        addLog(room, 'join', `${playerName} joined`);
-        logger.info('[Bluff] Player joined', { roomCode, player: playerName, total: room.players.length });
+        socket.join(code);
+        addLog(room, 'join', `${playerName || 'A player'} joined`);
+        await saveBluffRoom(room);
 
+        logger.info('[Bluff] Player joined', { roomCode: code, player: playerName, total: room.players.length });
         socket.emit('bluff_room_joined', { roomCode: room.roomCode, playerId: stableId });
         emitRoomState(io, room);
         io.to(room.roomCode).emit('bluff_player_joined', { playerName, playerCount: room.players.length });
       } catch (err) {
-        logger.error('[Bluff] join_room error', { error: err.message });
+        logger.error('[Bluff] join_room error', { error: err.message, stack: err.stack });
         socket.emit('bluff_error', { message: 'Failed to join room' });
       }
     });
 
-    // ── Check Room (for JoinPage) ────────────────────────────────────────────
-    socket.on('bluff_check_room', ({ roomCode }) => {
-      const room = bluffRooms.get(roomCode?.toUpperCase());
-      if (!room) return socket.emit('bluff_check_result', { exists: false });
-      socket.emit('bluff_check_result', {
-        exists: true,
-        joinable: room.status === 'waiting' && room.players.length < room.settings.maxPlayers,
-        status: room.status,
-        playerCount: room.players.length,
-      });
-    });
-
-    // ── Spectate ─────────────────────────────────────────────────────────────
-    socket.on('bluff_spectate', ({ roomCode }) => {
-      const room = bluffRooms.get(roomCode?.toUpperCase());
-      if (!room) return socket.emit('bluff_error', { message: 'Room not found' });
-      socket.join(`spectate:${roomCode.toUpperCase()}`);
-      socket.emit('bluff_spectate_joined', { roomCode: room.roomCode, status: room.status });
-      emitRoomState(io, room);
-    });
-
-    // ── Update Settings ──────────────────────────────────────────────────────
-    socket.on('bluff_update_settings', ({ roomCode, settings }) => {
-      const room = bluffRooms.get(roomCode);
-      if (!room) return;
-      const host = room.players.find(p => p.socketId === socket.id && p.isHost);
-      if (!host) return socket.emit('bluff_error', { message: 'Only host can change settings' });
-      room.settings = { ...room.settings, ...settings };
-      emitRoomState(io, room);
-    });
-
-    // ── Start Game ───────────────────────────────────────────────────────────
-    socket.on('bluff_start_game', ({ roomCode }) => {
+    socket.on('bluff_check_room', async ({ roomCode }) => {
       try {
-        const room = bluffRooms.get(roomCode);
+        const room = await findBluffRoom(roomCode);
+        if (!room) return socket.emit('bluff_check_result', { exists: false });
+
+        socket.emit('bluff_check_result', {
+          exists: true,
+          joinable: room.status === 'waiting' && room.players.length < room.settings.maxPlayers,
+          status: room.status,
+          playerCount: room.players.length,
+        });
+      } catch (err) {
+        logger.error('[Bluff] check_room error', { error: err.message });
+        socket.emit('bluff_check_result', { exists: false });
+      }
+    });
+
+    socket.on('bluff_spectate', async ({ roomCode }) => {
+      try {
+        const code = normalizeCode(roomCode);
+        const room = await findBluffRoom(code);
         if (!room) return socket.emit('bluff_error', { message: 'Room not found' });
+
+        socket.join(`spectate:${code}`);
+        socket.emit('bluff_spectate_joined', { roomCode: room.roomCode, status: room.status });
+        emitRoomState(io, room);
+      } catch (err) {
+        logger.error('[Bluff] spectate error', { error: err.message });
+        socket.emit('bluff_error', { message: 'Failed to spectate room' });
+      }
+    });
+
+    socket.on('bluff_update_settings', async ({ roomCode, settings }) => {
+      try {
+        const room = await findBluffRoom(roomCode);
+        if (!room) return;
+
+        const host = room.players.find(p => p.socketId === socket.id && p.isHost);
+        if (!host) return socket.emit('bluff_error', { message: 'Only host can change settings' });
+
+        room.settings = { ...room.settings.toObject(), ...settings };
+        await saveBluffRoom(room);
+        emitRoomState(io, room);
+      } catch (err) {
+        logger.error('[Bluff] update_settings error', { error: err.message });
+        socket.emit('bluff_error', { message: 'Failed to update settings' });
+      }
+    });
+
+    socket.on('bluff_start_game', async ({ roomCode }) => {
+      try {
+        const code = normalizeCode(roomCode);
+        const room = await findBluffRoom(code);
+        if (!room) return socket.emit('bluff_error', { message: 'Room not found' });
+
         const host = room.players.find(p => p.socketId === socket.id && p.isHost);
         if (!host) return socket.emit('bluff_error', { message: 'Only host can start' });
         if (room.players.length < 2) return socket.emit('bluff_error', { message: 'Need at least 2 players' });
 
-        // Deal cards
         const hands = dealCards(room.players.length);
         room.players.forEach((p, i) => {
           p.hand = hands[i];
+          p.cardCount = hands[i].length;
           p.isAlive = true;
         });
 
@@ -199,20 +259,20 @@ module.exports = (io) => {
         room.log = [];
         addLog(room, 'start', 'Game started! Cards have been dealt.');
 
-        logger.info('[Bluff] Game started', { roomCode, players: room.players.map(p => p.name) });
+        await saveBluffRoom(room);
+        logger.info('[Bluff] Game started', { roomCode: code, players: room.players.map(p => p.name) });
         emitRoomState(io, room);
-        io.to(roomCode).emit('bluff_game_started', { firstPlayer: room.players[0].name });
+        io.to(code).emit('bluff_game_started', { firstPlayer: room.players[0].name });
       } catch (err) {
-        logger.error('[Bluff] start_game error', { error: err.message });
+        logger.error('[Bluff] start_game error', { error: err.message, stack: err.stack });
         socket.emit('bluff_error', { message: 'Failed to start game' });
       }
     });
 
-    // ── Play Cards ───────────────────────────────────────────────────────────
-    // Player places cards face-down and claims they are all of a certain rank
-    socket.on('bluff_play_cards', ({ roomCode, cardIds, claimedRank }) => {
+    socket.on('bluff_play_cards', async ({ roomCode, cardIds, claimedRank }) => {
       try {
-        const room = bluffRooms.get(roomCode);
+        const code = normalizeCode(roomCode);
+        const room = await findBluffRoom(code);
         if (!room || room.status !== 'playing') return;
 
         const currentPlayer = room.players[room.currentPlayerIndex];
@@ -222,24 +282,17 @@ module.exports = (io) => {
         if (!cardIds?.length) return socket.emit('bluff_error', { message: 'Select at least 1 card' });
         if (!RANKS.includes(claimedRank)) return socket.emit('bluff_error', { message: 'Invalid rank claimed' });
 
-        // Enforce rank must be >= last claimed rank (if pile not empty)
-        if (room.lastClaim) {
-          const RANK_ORDER = { '2':2,'3':3,'4':4,'5':5,'6':6,'7':7,'8':8,'9':9,'10':10,'J':11,'Q':12,'K':13,'A':14 };
-          if (RANK_ORDER[claimedRank] < RANK_ORDER[room.lastClaim.rank]) {
-            return socket.emit('bluff_error', { message: `Must claim rank ≥ ${room.lastClaim.rank}` });
-          }
+        if (room.lastClaim && RANK_ORDER[claimedRank] < RANK_ORDER[room.lastClaim.rank]) {
+          return socket.emit('bluff_error', { message: `Must claim rank >= ${room.lastClaim.rank}` });
         }
 
-        // Find cards in player's hand
-        const playedCards = cardIds.map(id => currentPlayer.hand.find(c => c.id === id)).filter(Boolean);
+        const hand = getHand(currentPlayer);
+        const playedCards = cardIds.map(id => hand.find(c => c.id === id)).filter(Boolean);
         if (playedCards.length !== cardIds.length) {
           return socket.emit('bluff_error', { message: 'Invalid cards selected' });
         }
 
-        // Remove from hand
-        currentPlayer.hand = currentPlayer.hand.filter(c => !cardIds.includes(c.id));
-
-        // Add to pile (face down)
+        currentPlayer.hand = hand.filter(c => !cardIds.includes(c.id));
         room.pile.push(...playedCards);
         room.lastPlayedCards = playedCards;
         room.lastClaim = {
@@ -250,38 +303,37 @@ module.exports = (io) => {
         };
         room.passCount = 0;
 
-        addLog(room, 'play', `${currentPlayer.name} played ${playedCards.length} card${playedCards.length > 1 ? 's' : ''}, claiming ${playedCards.length}× ${claimedRank}`);
-        logger.info('[Bluff] Cards played', { roomCode, player: currentPlayer.name, count: playedCards.length, claimed: claimedRank });
+        addLog(room, 'play', `${currentPlayer.name} played ${playedCards.length} card${playedCards.length > 1 ? 's' : ''}, claiming ${playedCards.length}x ${claimedRank}`);
+        logger.info('[Bluff] Cards played', { roomCode: code, player: currentPlayer.name, count: playedCards.length, claimed: claimedRank });
 
-        // Check win condition — empty hand
-        if (currentPlayer.hand.length === 0) {
-          room.winner = currentPlayer;
+        if (getHand(currentPlayer).length === 0) {
+          room.winner = currentPlayer.toObject ? currentPlayer.toObject() : currentPlayer;
           room.status = 'finished';
-          addLog(room, 'win', `🏆 ${currentPlayer.name} played their last card and wins!`);
-          logger.info('[Bluff] Game over — hand empty', { roomCode, winner: currentPlayer.name });
+          addLog(room, 'win', `${currentPlayer.name} played their last card and wins!`);
+          await saveBluffRoom(room);
           emitRoomState(io, room);
-          io.to(roomCode).emit('bluff_game_over', { winner: currentPlayer, players: room.players });
+          io.to(code).emit('bluff_game_over', { winner: room.winner, players: room.players });
           return;
         }
 
-        // Advance turn
         room.currentPlayerIndex = nextAliveIndex(room, room.currentPlayerIndex);
+        await saveBluffRoom(room);
         emitRoomState(io, room);
-        io.to(roomCode).emit('bluff_cards_played', {
+        io.to(code).emit('bluff_cards_played', {
           playerName: currentPlayer.name,
           count: playedCards.length,
           claimedRank,
         });
       } catch (err) {
-        logger.error('[Bluff] play_cards error', { error: err.message });
+        logger.error('[Bluff] play_cards error', { error: err.message, stack: err.stack });
         socket.emit('bluff_error', { message: 'Failed to play cards' });
       }
     });
 
-    // ── Challenge ────────────────────────────────────────────────────────────
-    socket.on('bluff_challenge', ({ roomCode }) => {
+    socket.on('bluff_challenge', async ({ roomCode }) => {
       try {
-        const room = bluffRooms.get(roomCode);
+        const code = normalizeCode(roomCode);
+        const room = await findBluffRoom(code);
         if (!room || room.status !== 'playing') return;
         if (!room.lastClaim) return socket.emit('bluff_error', { message: 'Nothing to challenge' });
 
@@ -295,20 +347,17 @@ module.exports = (io) => {
         const bluff = wasBluff(room.lastPlayedCards, room.lastClaim.rank);
         const loser = bluff ? claimedPlayer : challenger;
 
-        // Loser picks up the whole pile
-        loser.hand.push(...room.pile);
+        loser.hand = [...getHand(loser), ...room.pile];
 
         const revealInfo = room.lastPlayedCards.map(c => c.id).join(', ');
         addLog(room, bluff ? 'caught' : 'safe',
           bluff
-            ? `🎯 ${challenger.name} challenged! ${claimedPlayer.name} was BLUFFING (played ${revealInfo}). ${claimedPlayer.name} picks up ${room.pile.length} cards!`
-            : `😤 ${challenger.name} challenged but ${claimedPlayer.name} was HONEST. ${challenger.name} picks up ${room.pile.length} cards!`
+            ? `${challenger.name} challenged! ${claimedPlayer.name} was bluffing (played ${revealInfo}). ${claimedPlayer.name} picks up ${room.pile.length} cards!`
+            : `${challenger.name} challenged but ${claimedPlayer.name} was honest. ${challenger.name} picks up ${room.pile.length} cards!`
         );
 
-        logger.info('[Bluff] Challenge resolved', { roomCode, challenger: challenger.name, bluff, loser: loser.name });
-
-        // Emit reveal event to everyone
-        io.to(roomCode).emit('bluff_challenge_result', {
+        logger.info('[Bluff] Challenge resolved', { roomCode: code, challenger: challenger.name, bluff, loser: loser.name });
+        io.to(code).emit('bluff_challenge_result', {
           challengerName: challenger.name,
           claimedPlayerName: claimedPlayer.name,
           claimedRank: room.lastClaim.rank,
@@ -318,37 +367,35 @@ module.exports = (io) => {
           pileCount: room.pile.length,
         });
 
-        // Reset pile
         room.pile = [];
         room.lastClaim = null;
         room.lastPlayedCards = [];
         room.passCount = 0;
-
-        // Loser goes next
         room.currentPlayerIndex = room.players.findIndex(p => p.id === loser.id);
 
-        // Check win condition after challenge (loser might have just emptied)
         const winner = checkWinner(room);
         if (winner) {
-          room.winner = winner;
+          room.winner = winner.toObject ? winner.toObject() : winner;
           room.status = 'finished';
-          addLog(room, 'win', `🏆 ${winner.name} wins!`);
+          addLog(room, 'win', `${winner.name} wins!`);
+          await saveBluffRoom(room);
           emitRoomState(io, room);
-          io.to(roomCode).emit('bluff_game_over', { winner, players: room.players });
+          io.to(code).emit('bluff_game_over', { winner: room.winner, players: room.players });
           return;
         }
 
+        await saveBluffRoom(room);
         emitRoomState(io, room);
       } catch (err) {
-        logger.error('[Bluff] challenge error', { error: err.message });
+        logger.error('[Bluff] challenge error', { error: err.message, stack: err.stack });
         socket.emit('bluff_error', { message: 'Failed to process challenge' });
       }
     });
 
-    // ── Pass ─────────────────────────────────────────────────────────────────
-    socket.on('bluff_pass', ({ roomCode }) => {
+    socket.on('bluff_pass', async ({ roomCode }) => {
       try {
-        const room = bluffRooms.get(roomCode);
+        const code = normalizeCode(roomCode);
+        const room = await findBluffRoom(code);
         if (!room || room.status !== 'playing') return;
 
         const currentPlayer = room.players[room.currentPlayerIndex];
@@ -356,82 +403,83 @@ module.exports = (io) => {
           return socket.emit('bluff_error', { message: "It's not your turn!" });
         }
         if (!room.lastClaim) {
-          return socket.emit('bluff_error', { message: "Can't pass on the first turn — you must play cards" });
+          return socket.emit('bluff_error', { message: "Can't pass on the first turn - you must play cards" });
         }
 
         room.passCount++;
         addLog(room, 'pass', `${currentPlayer.name} passed`);
 
-        // If everyone alive has passed (except the last player who played), clear the pile
         const alivePlayers = room.players.filter(p => p.isAlive).length;
         if (room.passCount >= alivePlayers - 1) {
-          addLog(room, 'clear', 'All players passed — pile cleared! New round starts.');
+          addLog(room, 'clear', 'All players passed - pile cleared! New round starts.');
           room.pile = [];
           room.lastClaim = null;
           room.lastPlayedCards = [];
           room.passCount = 0;
-          io.to(roomCode).emit('bluff_pile_cleared', {});
+          io.to(code).emit('bluff_pile_cleared', {});
         }
 
         room.currentPlayerIndex = nextAliveIndex(room, room.currentPlayerIndex);
+        await saveBluffRoom(room);
         emitRoomState(io, room);
-        io.to(roomCode).emit('bluff_passed', { playerName: currentPlayer.name });
+        io.to(code).emit('bluff_passed', { playerName: currentPlayer.name });
       } catch (err) {
-        logger.error('[Bluff] pass error', { error: err.message });
+        logger.error('[Bluff] pass error', { error: err.message, stack: err.stack });
         socket.emit('bluff_error', { message: 'Failed to pass' });
       }
     });
 
-    // ── Disconnect ───────────────────────────────────────────────────────────
-    socket.on('disconnect', () => {
-      bluffRooms.forEach((room, roomCode) => {
-        const playerIdx = room.players.findIndex(p => p.socketId === socket.id);
-        if (playerIdx === -1) return;
+    socket.on('disconnect', async () => {
+      try {
+        const rooms = await Room.find({ game: 'cardsbluff', 'players.socketId': socket.id });
+        for (const room of rooms) {
+          const playerIdx = room.players.findIndex(p => p.socketId === socket.id);
+          if (playerIdx === -1) continue;
 
-        const player = room.players[playerIdx];
-        const wasHost = player.isHost;
-        logger.info('[Bluff] Player disconnected', { roomCode, player: player.name });
+          const player = room.players[playerIdx];
+          const wasHost = player.isHost;
+          logger.info('[Bluff] Player disconnected', { roomCode: room.roomCode, player: player.name });
 
-        if (room.status === 'waiting') {
-          // Remove from room entirely
-          room.players.splice(playerIdx, 1);
-          if (room.players.length === 0) { bluffRooms.delete(roomCode); return; }
-          if (wasHost) room.players[0].isHost = true;
-          addLog(room, 'leave', `${player.name} left`);
-          io.to(roomCode).emit('bluff_player_left', { playerName: player.name, players: room.players });
-        } else if (room.status === 'playing') {
-          // Mark as disconnected / out but keep in game state for continuity
-          player.isAlive = false;
-          player.hand = []; // cards go to void (house rule — keeps game moving)
-          addLog(room, 'leave', `${player.name} disconnected and is out`);
-
-          const winner = checkWinner(room);
-          if (winner) {
-            room.winner = winner;
-            room.status = 'finished';
-            addLog(room, 'win', `🏆 ${winner.name} wins!`);
-            io.to(roomCode).emit('bluff_game_over', { winner, players: room.players });
-          } else {
-            // If it was their turn, advance
-            if (room.currentPlayerIndex === playerIdx) {
-              room.currentPlayerIndex = nextAliveIndex(room, playerIdx);
+          if (room.status === 'waiting') {
+            room.players.splice(playerIdx, 1);
+            if (room.players.length === 0) {
+              await Room.deleteOne({ _id: room._id });
+              logger.info('[Bluff] Empty room deleted', { roomCode: room.roomCode });
+              continue;
             }
-          }
-        }
-        emitRoomState(io, room);
-      });
-    });
-  });
 
-  // Cleanup empty rooms every 30 minutes
-  setInterval(() => {
-    const now = Date.now();
-    bluffRooms.forEach((room, code) => {
-      const old = room.log[0]?.ts || now;
-      if (now - old > 2 * 60 * 60 * 1000) { // 2 hours
-        bluffRooms.delete(code);
-        logger.info('[Bluff] Room auto-cleaned', { roomCode: code });
+            if (wasHost) room.players[0].isHost = true;
+            addLog(room, 'leave', `${player.name} left`);
+            await saveBluffRoom(room);
+            io.to(room.roomCode).emit('bluff_player_left', { playerName: player.name, players: room.players });
+          } else if (room.status === 'playing') {
+            player.isAlive = false;
+            player.hand = [];
+            addLog(room, 'leave', `${player.name} disconnected and is out`);
+
+            const winner = checkWinner(room);
+            if (winner) {
+              room.winner = winner.toObject ? winner.toObject() : winner;
+              room.status = 'finished';
+              addLog(room, 'win', `${winner.name} wins!`);
+              await saveBluffRoom(room);
+              io.to(room.roomCode).emit('bluff_game_over', { winner: room.winner, players: room.players });
+            } else {
+              if (room.currentPlayerIndex === playerIdx) {
+                room.currentPlayerIndex = nextAliveIndex(room, playerIdx);
+              }
+              await saveBluffRoom(room);
+            }
+          } else {
+            player.socketId = null;
+            await saveBluffRoom(room);
+          }
+
+          emitRoomState(io, room);
+        }
+      } catch (err) {
+        logger.error('[Bluff] disconnect error', { socketId: socket.id, error: err.message, stack: err.stack });
       }
     });
-  }, 30 * 60 * 1000);
+  });
 };
