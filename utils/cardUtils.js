@@ -1,5 +1,8 @@
 // ── Card Deck Utilities ──────────────────────────────────────────────────────
 
+// KEEP IN SYNC WITH client/src/constants/cardConstants.js
+// These values are duplicated across repos. If you change anything here,
+// update the client file too — mismatches cause silent card validation bugs.
 const RANKS = ['2','3','4','5','6','7','8','9','10','J','Q','K','A'];
 const SUITS = ['♠','♥','♦','♣'];
 const RANK_ORDER = { '2':2,'3':3,'4':4,'5':5,'6':6,'7':7,'8':8,'9':9,'10':10,'J':11,'Q':12,'K':13,'A':14 };
