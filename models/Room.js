@@ -24,6 +24,7 @@ const RoomSchema = new mongoose.Schema({
   },
   currentPlayerIndex: { type: Number, default: 0 },
   currentSubstring: { type: String, default: '' },
+  turnStartedAt:      { type: Date, default: null },
   usedWords: [String],
   pile: { type: [mongoose.Schema.Types.Mixed], default: [] },
   lastClaim: { type: mongoose.Schema.Types.Mixed, default: null },

@@ -6,7 +6,6 @@ const { generateUniqueRoomCode } = require("../utils/roomUtils");
 
 // ── Active timers — exported so index.js can clear them on graceful shutdown ──
 const activeTimers = {}; // roomCode -> setTimeout handle
-module.exports.activeTimers = activeTimers;
 
 // ── Timer helpers ─────────────────────────────────────────────────────────────
 
@@ -89,6 +88,7 @@ async function advanceTurn(io, room) {
 
   room.currentPlayerIndex = nextIndex;
   room.currentSubstring = generateSubstring();
+  room.turnStartedAt = new Date();
   await room.save();
 
   const currentPlayer = room.players[nextIndex];
@@ -124,9 +124,74 @@ async function generateRoomCode(maxAttempts = 5) {
   );
 }
 
+// ── Startup recovery — restores timers for games active before a crash/restart
+async function recoverActiveGames(io) {
+  try {
+    const activeRooms = await Room.find({
+      status: "playing",
+      game: "wordbomb",
+    });
+
+    if (activeRooms.length === 0) {
+      logger.info("[Recovery] No active Word Bomb games to recover");
+      return;
+    }
+
+    logger.info(
+      `[Recovery] Found ${activeRooms.length} active game(s) — restoring timers`,
+    );
+
+    for (const room of activeRooms) {
+      const turnDuration = room.settings.turnTimer; // seconds
+      const startedAt = room.turnStartedAt
+        ? new Date(room.turnStartedAt)
+        : null;
+      const now = Date.now();
+
+      let remainingMs;
+
+      if (!startedAt) {
+        // turnStartedAt not set (game created before this fix was deployed)
+        // Play it safe: give the current player a full fresh turn
+        remainingMs = turnDuration * 1000;
+        logger.warn("[Recovery] No turnStartedAt found — giving full turn", {
+          roomCode: room.roomCode,
+          player: room.players[room.currentPlayerIndex]?.name,
+        });
+      } else {
+        const elapsedMs = now - startedAt.getTime();
+        remainingMs = turnDuration * 1000 - elapsedMs;
+      }
+
+      if (remainingMs <= 0) {
+        // Time already expired while server was down — advance turn immediately
+        logger.info("[Recovery] Turn already expired — advancing immediately", {
+          roomCode: room.roomCode,
+          expiredMs: Math.abs(remainingMs),
+        });
+        await advanceTurn(io, room);
+      } else {
+        // Time still remaining — restart timer with the remaining duration
+        const remainingSec = Math.ceil(remainingMs / 1000);
+        logger.info("[Recovery] Restarting timer with remaining time", {
+          roomCode: room.roomCode,
+          remainingSec,
+          player: room.players[room.currentPlayerIndex]?.name,
+        });
+        startTurnTimer(io, room.roomCode, remainingSec);
+      }
+    }
+  } catch (err) {
+    logger.error("[Recovery] Failed to recover active games", {
+      error: err.message,
+      stack: err.stack,
+    });
+  }
+}
+
 // ── Socket handlers ───────────────────────────────────────────────────────────
 
-module.exports = (io) => {
+function registerGameSocket(io) {
   io.on("connection", (socket) => {
     logger.info("Socket connected", { socketId: socket.id });
 
@@ -394,6 +459,7 @@ module.exports = (io) => {
         room.currentPlayerIndex = 0;
         room.currentSubstring = generateSubstring();
         room.usedWords = [];
+        room.turnStartedAt = new Date();
         await room.save();
 
         logger.info("Game started", {
@@ -599,4 +665,8 @@ module.exports = (io) => {
       }
     });
   });
-};
+}
+
+module.exports                          = registerGameSocket;
+module.exports.activeTimers             = activeTimers;
+module.exports.recoverActiveGames       = recoverActiveGames;
