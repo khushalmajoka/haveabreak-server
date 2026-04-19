@@ -12,7 +12,7 @@ const PlayerSchema = new mongoose.Schema({
 });
 
 const RoomSchema = new mongoose.Schema({
-  roomCode: { type: String, unique: true, required: true },
+  roomCode: { type: String, required: true },
   game: { type: String, enum: ['wordbomb', 'cardsbluff'], default: 'wordbomb' },
   players: [PlayerSchema],
   status: { type: String, enum: ['waiting', 'playing', 'finished'], default: 'waiting' },
@@ -40,5 +40,7 @@ const RoomSchema = new mongoose.Schema({
   },
   createdAt: { type: Date, default: Date.now, expires: 86400 }, // auto-delete after 24h
 });
+
+RoomSchema.index({ roomCode: 1, game: 1 }, { unique: true });
 
 module.exports = mongoose.model('Room', RoomSchema);

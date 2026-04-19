@@ -2,6 +2,7 @@ const Room             = require('../models/Room');
 const { generateSubstring, isValidWord } = require('../utils/wordUtils');
 const logger           = require('../utils/logger');
 const validate         = require('../utils/validate');
+const { generateUniqueRoomCode } = require('../utils/roomUtils');
 
 // ── Active timers — exported so index.js can clear them on graceful shutdown ──
 const activeTimers = {}; // roomCode -> setTimeout handle
@@ -105,11 +106,11 @@ async function advanceTurn(io, room) {
 }
 
 // ── Room code generator with retry on duplicate key ───────────────────────────
-async function generateUniqueRoomCode(maxAttempts = 5) {
+async function generateRoomCode(maxAttempts = 5) {
   for (let i = 0; i < maxAttempts; i++) {
-    const code = Math.random().toString(36).substring(2, 7).toUpperCase();
-    const existing = await Room.findOne({ roomCode: code, game: 'wordbomb' });
-    if (!existing) return code;
+    const roomCode = await generateUniqueRoomCode('wordbomb');
+    const existing = await Room.findOne({ roomCode: roomCode, game: 'wordbomb' });
+    if (!existing) return roomCode;
   }
   throw new Error('Could not generate a unique room code after several attempts');
 }
@@ -134,7 +135,7 @@ module.exports = (io) => {
         const stableId  = (typeof playerId === 'string' && playerId.length <= 64) ? playerId : socket.id;
         const cleanName = playerName.trim();
 
-        const roomCode = await generateUniqueRoomCode();
+        const roomCode = await generateRoomCode();
         logger.info('Creating room', { roomCode, host: cleanName, stableId, settings });
 
         const room = new Room({
