@@ -288,6 +288,25 @@ function registerGameSocket(io) {
           logger.warn("Join failed — room not found", { roomCode });
           return socket.emit("error", { message: "Room not found" });
         }
+
+        // Reconnect during active game: player already exists, just refresh their socketId
+        const existingPlayer = room.players.find((p) => p.id === stableId);
+        if (existingPlayer) {
+          existingPlayer.socketId = socket.id;
+          await room.save();
+          socket.join(roomCode);
+          logger.info("Player reconnected to active game", {
+            roomCode,
+            playerName: existingPlayer.name,
+          });
+          socket.emit("room_joined", {
+            roomCode: room.roomCode,
+            room,
+            playerId: stableId,
+          });
+          return;
+        }
+
         if (room.status !== "waiting") {
           logger.warn("Join failed — game in progress", {
             roomCode,
@@ -667,6 +686,6 @@ function registerGameSocket(io) {
   });
 }
 
-module.exports                          = registerGameSocket;
-module.exports.activeTimers             = activeTimers;
-module.exports.recoverActiveGames       = recoverActiveGames;
+module.exports = registerGameSocket;
+module.exports.activeTimers = activeTimers;
+module.exports.recoverActiveGames = recoverActiveGames;
