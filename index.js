@@ -1,4 +1,5 @@
 require("dotenv").config();
+const Room = require('./models/Room');
 
 // ── Env validation — fail fast if required vars are missing ──────────────────
 function validateEnv() {
@@ -168,6 +169,16 @@ app.get("/health", async (req, res) => {
     ["disconnected", "connected", "connecting", "disconnecting"][dbState] ||
     "unknown";
   const isHealthy = dbState === 1;
+
+  // Count active rooms — useful for load monitoring
+  let activeRooms = null;
+  if (isHealthy) {
+    try {
+      activeRooms = await Room.countDocuments({ status: 'playing' });
+    } catch {
+      // Non-fatal — health check still responds even if count fails
+    }
+  }
 
   const status = {
     status: isHealthy ? "ok" : "degraded",
