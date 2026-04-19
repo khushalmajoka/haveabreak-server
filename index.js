@@ -14,6 +14,14 @@ function validateEnv() {
 }
 validateEnv();
 
+// Warn about optional vars that have meaningful production defaults
+if (!process.env.NODE_ENV) {
+  console.warn('[WARN] NODE_ENV is not set — defaulting to development');
+}
+if (!process.env.LOG_LEVEL) {
+  console.warn('[WARN] LOG_LEVEL is not set — defaulting to info (set to warn in production)');
+}
+
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
