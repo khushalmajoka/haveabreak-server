@@ -6,6 +6,7 @@ const { generateUniqueRoomCode } = require("../utils/roomUtils");
 
 // ── Active timers — exported so index.js can clear them on graceful shutdown ──
 const activeTimers = {}; // roomCode -> setTimeout handle
+const processingSubmit = new Set(); // roomCode -> in-flight guard
 
 // ── Timer helpers ─────────────────────────────────────────────────────────────
 
@@ -289,22 +290,22 @@ function registerGameSocket(io) {
           return socket.emit("error", { message: "Room not found" });
         }
 
-        // Reconnect during active game: player already exists, just refresh their socketId
+        // Reconnect: player already exists — refresh their socketId and re-subscribe
         const existingPlayer = room.players.find((p) => p.id === stableId);
         if (existingPlayer) {
           existingPlayer.socketId = socket.id;
           await room.save();
           socket.join(roomCode);
-          logger.info("Player reconnected to active game", {
+          logger.info("Player reconnected to room", {
             roomCode,
-            playerName: existingPlayer.name,
+            player: existingPlayer.name,
+            status: room.status,
           });
-          socket.emit("room_joined", {
+          return socket.emit("room_joined", {
             roomCode: room.roomCode,
             room,
             playerId: stableId,
           });
-          return;
         }
 
         if (room.status !== "waiting") {
@@ -537,7 +538,8 @@ function registerGameSocket(io) {
 
         const w = data.word.toLowerCase().trim();
 
-        if (room.usedWords.includes(w)) {
+        const usedSet = new Set(room.usedWords);
+        if (usedSet.has(w)) {
           logger.debug("Word already used", {
             roomCode,
             word: w,
@@ -562,26 +564,39 @@ function registerGameSocket(io) {
           });
         }
 
-        clearRoomTimer(roomCode);
-        room.usedWords.push(w);
-        await room.save();
+        // Guard against double-submission race condition
+        if (processingSubmit.has(roomCode)) {
+          return socket.emit("word_result", {
+            success: false,
+            reason: "Please wait, processing your last word…",
+          });
+        }
+        processingSubmit.add(roomCode);
 
-        logger.info("Word accepted", {
-          roomCode,
-          player: currentPlayer.name,
-          word: w,
-          substring: room.currentSubstring,
-          totalUsedWords: room.usedWords.length,
-        });
+        try {
+          clearRoomTimer(roomCode);
+          room.usedWords.push(w);
+          await room.save();
 
-        io.to(roomCode).emit("word_accepted", {
-          playerId: currentPlayer.id,
-          playerName: currentPlayer.name,
-          word: w,
-          substring: room.currentSubstring,
-        });
+          logger.info("Word accepted", {
+            roomCode,
+            player: currentPlayer.name,
+            word: w,
+            substring: room.currentSubstring,
+            totalUsedWords: room.usedWords.length,
+          });
 
-        await advanceTurn(io, room);
+          io.to(roomCode).emit("word_accepted", {
+            playerId: currentPlayer.id,
+            playerName: currentPlayer.name,
+            word: w,
+            substring: room.currentSubstring,
+          });
+
+          await advanceTurn(io, room);
+        } finally {
+          processingSubmit.delete(roomCode);
+        }
       } catch (err) {
         logger.error("submit_word failed", {
           error: err.message,
@@ -627,7 +642,17 @@ function registerGameSocket(io) {
 
           const wasHost = room.players[playerIdx].isHost;
           const playerName = room.players[playerIdx].name;
-          room.players.splice(playerIdx, 1);
+          const leavingPlayer = room.players[playerIdx];
+
+          // During an active game: mark disconnected rather than splice,
+          // so the player can reconnect and resume (socketId is refreshed on rejoin).
+          // During waiting: remove them fully (they haven't started yet).
+          if (room.status === "playing") {
+            leavingPlayer.isAlive = false;
+            leavingPlayer.socketId = null;
+          } else {
+            room.players.splice(playerIdx, 1);
+          }
 
           logger.info("Player removed from room on disconnect", {
             roomCode: room.roomCode,

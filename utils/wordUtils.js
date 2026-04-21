@@ -66,6 +66,7 @@
 // ];
 
 const WORD_LIST = require('an-array-of-english-words');
+const WORD_SET  = new Set(WORD_LIST); // O(1) lookups — built once at startup
 
 // Generate a random substring from a random word
 function generateSubstring() {
@@ -85,7 +86,7 @@ function isValidWord(word, substring) {
   const sub = substring.toLowerCase();
   if (w.length < 2) return false;
   if (!w.includes(sub)) return false;
-  return WORD_LIST.includes(w);
+  return WORD_SET.has(w);
 }
 
 module.exports = { WORD_LIST, generateSubstring, isValidWord };
